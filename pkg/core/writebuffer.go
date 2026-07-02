@@ -13,10 +13,11 @@ import (
 // WriteTo will be locked until Write fails or Close will be called.
 type WriteBuffer struct {
 	io.Writer
-	err   error
-	mu    sync.Mutex
-	wg    sync.WaitGroup
-	state byte
+	err    error
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	state  byte
+	closed bool
 }
 
 func NewWriteBuffer(wr io.Writer) *WriteBuffer {
@@ -57,6 +58,7 @@ func (w *WriteBuffer) Close() error {
 		if w.err == nil {
 			w.err = io.ErrClosedPipe
 		}
+		w.closed = true
 		w.done()
 	}
 	w.mu.Unlock()
@@ -86,7 +88,8 @@ const (
 )
 
 func (w *WriteBuffer) add() {
-	if w.state == none {
+	// don't Add if Close already ran, or WriteTo would block on a Done that already fired
+	if w.state == none && !w.closed {
 		w.state = start
 		w.wg.Add(1)
 	}
