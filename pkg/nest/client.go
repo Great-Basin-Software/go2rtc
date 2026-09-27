@@ -227,7 +227,6 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 			// and its ICE agent's mDNS sockets (:5353) would leak on every retry.
 			_ = pc.Close()
 			lastErr = err
-			_ = pc.Close()
 			if attempt < maxRetries-1 {
 				time.Sleep(retryDelay)
 				retryDelay *= 2
