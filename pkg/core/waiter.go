@@ -35,22 +35,30 @@ func (w *Waiter) Wait() error {
 
 	w.WaitGroup.Wait()
 
-	return w.err
+	w.mu.Lock()
+	err := w.err
+	w.mu.Unlock()
+	return err
 }
 
 func (w *Waiter) Done(err error) {
 	w.mu.Lock()
 
 	// safe run Done only when have tasks
-	if w.state > 0 {
+	release := w.state > 0
+	if release {
 		w.state--
-		w.WaitGroup.Done()
 	}
 
-	// block waiter for any operations after last done
+	// block waiter for any operations after last done; the error is stored
+	// before the waiters are released, so Wait never returns without it
 	if w.state == 0 {
 		w.state = -1
 		w.err = err
+	}
+
+	if release {
+		w.WaitGroup.Done()
 	}
 
 	w.mu.Unlock()
