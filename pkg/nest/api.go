@@ -34,8 +34,10 @@ type API struct {
 	// calling it, so the owner should close the producer to trigger a re-dial.
 	OnSessionLost func(err error)
 
+	extendMu    sync.Mutex
 	extendTimer *time.Timer
 	extendStop  chan struct{}
+	extendDone  chan struct{} // closed when the extend loop has returned
 }
 
 // Endpoints are variables so tests can point them at an httptest server.
@@ -537,6 +539,8 @@ type Device struct {
 }
 
 func (a *API) StartExtendStreamTimer() {
+	a.extendMu.Lock()
+	defer a.extendMu.Unlock()
 	if a.extendTimer != nil {
 		return
 	}
@@ -545,14 +549,22 @@ func (a *API) StartExtendStreamTimer() {
 	// returns a new expiresAt, so keep extending until the stream stops.
 	timer := time.NewTimer(a.extendDelay())
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	a.extendTimer = timer
 	a.extendStop = stop
+	a.extendDone = done
 
 	go func() {
+		defer close(done)
 		attempt := 0
 		for {
 			select {
 			case <-timer.C:
+				select {
+				case <-stop: // stopped while the timer fired
+					return
+				default:
+				}
 				err := a.extendOnce()
 				if err == nil {
 					attempt = 0
@@ -599,6 +611,17 @@ func (a *API) extendOnce() error {
 }
 
 func (a *API) StopExtendStreamTimer() {
+	a.stopExtend()
+}
+
+// stopExtend stops the extend loop and returns a channel closed once the
+// loop has returned. An extend already talking to Google finishes first and
+// writes the Stream* fields, so read them (to stop the session) only after
+// the channel is closed. Never wait on it inside the loop: OnSessionLost
+// runs there and can lead to Stop.
+func (a *API) stopExtend() <-chan struct{} {
+	a.extendMu.Lock()
+	defer a.extendMu.Unlock()
 	if a.extendTimer != nil {
 		a.extendTimer.Stop()
 		a.extendTimer = nil
@@ -607,4 +630,12 @@ func (a *API) StopExtendStreamTimer() {
 		close(a.extendStop)
 		a.extendStop = nil
 	}
+	done := a.extendDone
+	a.extendDone = nil
+	if done == nil {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return done
 }

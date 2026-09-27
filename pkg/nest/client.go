@@ -166,8 +166,11 @@ func (c *WebRTCClient) close(why string) {
 }
 
 func (c *WebRTCClient) Stop() error {
-	c.api.StopExtendStreamTimer()
-	go func(api *API) { _ = api.StopWebRTCStream() }(c.api)
+	done := c.api.stopExtend()
+	go func(api *API) {
+		<-done // an extend in flight writes the session fields
+		_ = api.StopWebRTCStream()
+	}(c.api)
 	return c.conn.Stop()
 }
 
@@ -290,8 +293,11 @@ func (c *RTSPClient) Start() error {
 }
 
 func (c *RTSPClient) Stop() error {
-	c.api.StopRTSPStream()
-	c.api.StopExtendStreamTimer()
+	done := c.api.stopExtend()
+	go func(api *API) {
+		<-done // an extend in flight writes the session fields
+		_ = api.StopRTSPStream()
+	}(c.api)
 	return c.conn.Stop()
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,6 +81,7 @@ func TestExtendLoopRetriesThenSucceeds(t *testing.T) {
 		}
 	}
 
+	<-api.stopExtend() // the loop writes StreamExpiresAt; read it once it has returned
 	if got := api.StreamExpiresAt; time.Until(got) < 30*time.Minute {
 		t.Fatalf("StreamExpiresAt not updated after successful extend: %v", got)
 	}
@@ -140,4 +142,49 @@ func TestStopExtendStreamTimerIsIdempotent(t *testing.T) {
 	api.StartExtendStreamTimer()
 	api.StopExtendStreamTimer()
 	api.StopExtendStreamTimer() // must not panic on double close
+}
+
+// A stop while an extend is talking to Google waits for it: the extend
+// writes the Stream* fields that stopping the session then reads.
+func TestStopWaitsForExtendInFlight(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	srv, calls := newExtendServer(t, func(call int32) time.Time {
+		if call == 1 {
+			close(entered)
+			<-release
+		}
+		return time.Now().Add(time.Hour)
+	})
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(letGo) // runs before srv.Close, which waits for the held request
+	api := setupExtendTest(t, srv)
+	api.StreamExpiresAt = time.Now().Add(10 * time.Millisecond) // extend at once
+
+	api.StartExtendStreamTimer()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the extend never started")
+	}
+
+	done := api.stopExtend()
+	select {
+	case <-done:
+		t.Fatal("stop reported the loop finished while an extend was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	letGo()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the loop did not return after its extend finished")
+	}
+	if time.Until(api.StreamExpiresAt) < 30*time.Minute {
+		t.Fatalf("the in-flight extend's expiry was lost: %v", api.StreamExpiresAt)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d extends, want 1: the loop extended again after the stop", n)
+	}
 }
