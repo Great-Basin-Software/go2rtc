@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,12 @@ type API struct {
 
 // Endpoints are variables so tests can point them at an httptest server.
 var (
-	tokenURL = "https://www.googleapis.com/oauth2/v4/token"
+	// tokenURL is where an OAuth token is refreshed: Google's, unless
+	// GO2RTC_NEST_TOKEN_URL names another, for a device whose maker keeps
+	// the OAuth client secret on its own server rather than in every device
+	// (the other end then asks Google with the secret and answers in
+	// Google's form).
+	tokenURL = envOr("GO2RTC_NEST_TOKEN_URL", "https://www.googleapis.com/oauth2/v4/token")
 	sdmURL   = "https://smartdevicemanagement.googleapis.com/v1/enterprises/"
 
 	// extendRetryDelays is the backoff used when extending the stream fails.
@@ -60,18 +66,26 @@ type DeviceInfo struct {
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
 
-func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
+// httpTimeout bounds every call to Google. It was 5000 s, held inside a
+// producer's Dial (and, for the token, under cacheMu), so one hung
+// request froze that camera, or every camera, for up to 83 minutes.
+const httpTimeout = 15 * time.Second
 
+func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	key := clientID + ":" + clientSecret + ":" + refreshToken
 	now := time.Now()
+
+	// The lock guards the map only, never a network call: a slow token
+	// refresh must not stop the other cameras from dialing.
+	cacheMu.Lock()
+	cached := cache[key]
+	cacheMu.Unlock()
 
 	// The cache only stores the OAuth token. Each caller gets its own API
 	// instance, because the Stream* fields hold per-stream session state -
 	// multiple cameras sharing one instance overwrite each other's session
 	// and only the last one gets extended.
-	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
+	if api := cached; api != nil && now.Before(api.ExpiresAt) {
 		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
 	}
 
@@ -82,7 +96,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		"refresh_token": []string{refreshToken},
 	}
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.PostForm(tokenURL, data)
 	if err != nil {
 		return nil, err
@@ -109,7 +123,9 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
 	}
 
+	cacheMu.Lock()
 	cache[key] = api
+	cacheMu.Unlock()
 
 	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
 }
@@ -123,7 +139,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -199,7 +215,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
+		client := &http.Client{Timeout: httpTimeout}
 		res, err := client.Do(req)
 		if err != nil {
 			return "", err
@@ -304,7 +320,7 @@ func (a *API) ExtendStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return err
@@ -356,7 +372,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -419,7 +435,7 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return err
@@ -434,6 +450,55 @@ func (a *API) StopRTSPStream() error {
 	a.StreamExtensionToken = ""
 	a.StreamToken = ""
 
+	return nil
+}
+
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// StopWebRTCStream tells Google the session is over, so an abandoned
+// session stops counting against the camera's stream quota.
+func (a *API) StopWebRTCStream() error {
+	if a.StreamProjectID == "" || a.StreamDeviceID == "" || a.StreamSessionID == "" {
+		return nil
+	}
+
+	var reqv struct {
+		Command string `json:"command"`
+		Params  struct {
+			MediaSessionID string `json:"mediaSessionId"`
+		} `json:"params"`
+	}
+	reqv.Command = "sdm.devices.commands.CameraLiveStream.StopWebRtcStream"
+	reqv.Params.MediaSessionID = a.StreamSessionID
+
+	b, err := json.Marshal(reqv)
+	if err != nil {
+		return err
+	}
+
+	uri := sdmURL + a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+
+	client := &http.Client{Timeout: httpTimeout}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		return errors.New("nest: wrong status: " + res.Status)
+	}
 	return nil
 }
 

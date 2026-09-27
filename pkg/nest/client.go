@@ -129,6 +129,7 @@ func (c *WebRTCClient) watchdog(stop <-chan struct{}) {
 
 func (c *WebRTCClient) Stop() error {
 	c.api.StopExtendStreamTimer()
+	go func(api *API) { _ = api.StopWebRTCStream() }(c.api)
 	return c.conn.Stop()
 }
 
