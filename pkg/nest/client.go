@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -15,6 +16,8 @@ import (
 type WebRTCClient struct {
 	conn *webrtc.Conn
 	api  *API
+
+	closed atomic.Pointer[string] // why the watchdog closed the conn, if it did
 }
 
 type RTSPClient struct {
@@ -73,9 +76,15 @@ func Dial(rawURL string) (core.Producer, error) {
 // Media inactivity watchdog: Google can stop sending RTP while the
 // PeerConnection never reaches `failed` (observed: 27 minutes of dead stream
 // with IgnoreDisconnected set). Close the conn so go2rtc re-dials.
+//
+// Google can also stop sending video while audio keeps arriving, so the
+// connection's bytes still move (seen on a wired Nest doorbell, 2026-09-26:
+// about 4 KB/s for minutes, no picture). Once video has arrived, a video
+// track silent for videoTimeout closes the conn too.
 const (
 	inactivityCheck   = 5 * time.Second
 	inactivityTimeout = 30 * time.Second
+	videoTimeout      = 15 * time.Second
 )
 
 func (c *WebRTCClient) GetMedias() []*core.Media {
@@ -99,7 +108,21 @@ func (c *WebRTCClient) Start() error {
 	go c.watchdog(stop)
 	err := c.conn.Start()
 	close(stop)
+	if why := c.closed.Load(); why != nil {
+		return errors.New(*why)
+	}
 	return err
+}
+
+// videoPackets is the packets received on the conn's video tracks.
+func (c *WebRTCClient) videoPackets() int {
+	n := 0
+	for _, r := range c.conn.Receivers {
+		if r.Codec != nil && r.Codec.IsVideo() {
+			n += r.Packets
+		}
+	}
+	return n
 }
 
 func (c *WebRTCClient) watchdog(stop <-chan struct{}) {
@@ -108,23 +131,38 @@ func (c *WebRTCClient) watchdog(stop <-chan struct{}) {
 
 	lastRecv := c.conn.Recv
 	lastChange := time.Now()
+	lastVideo := c.videoPackets()
+	lastVideoChange := time.Now()
 
 	for {
 		select {
 		case <-ticker.C:
+			if video := c.videoPackets(); video != lastVideo {
+				lastVideo = video
+				lastVideoChange = time.Now()
+			} else if video > 0 && time.Since(lastVideoChange) >= videoTimeout {
+				c.close("nest: no video for 15s while the session stayed open")
+				return
+			}
 			if recv := c.conn.Recv; recv != lastRecv {
 				lastRecv = recv
 				lastChange = time.Now()
 				continue
 			}
 			if idle := time.Since(lastChange); idle >= inactivityTimeout {
-				_ = c.conn.Close()
+				c.close("nest: nothing received for 30s")
 				return
 			}
 		case <-stop:
 			return
 		}
 	}
+}
+
+// close ends the conn so go2rtc dials a new session, recording why.
+func (c *WebRTCClient) close(why string) {
+	c.closed.Store(&why)
+	_ = c.conn.Close()
 }
 
 func (c *WebRTCClient) Stop() error {
